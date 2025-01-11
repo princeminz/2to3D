@@ -7,38 +7,47 @@ from time import time
 import cv2
 import numpy as np
 from time import time
+import argparse
+import os
 
-def create_side_by_side_video(left_outs, right_outs, output_file="side_by_side_video.mp4", fps=25):
-    """
-    Create a side-by-side video from left and right eye views where each element in left_outs and right_outs is a batch.
+parser = argparse.ArgumentParser()
+parser.add_argument('-i', '--input')
+parser.add_argument('-bs', '--batchsize')
+parser.add_argument('-o', '--output', default="side_by_side_video.mp4")
 
-    :param left_outs: List of batches of left eye view tensors.
-    :param right_outs: List of batches of right eye view tensors.
-    :param output_file: Name of the output video file.
-    :param fps: Frames per second for the output video.
-    """
-    # Use the first frame of the first batch to get dimensions
-    height, width = left_outs[0][0].shape[1], left_outs[0][0].shape[2]
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for .mp4
-    out = cv2.VideoWriter(output_file, fourcc, fps, (width*2, height))
+args = parser.parse_args()
 
-    for left_batch, right_batch in zip(left_outs, right_outs):
-        for left, right in zip(left_batch, right_batch):
-            # Convert torch tensors to numpy arrays and then to uint8 for cv2
-            left_frame = (left.permute(1, 2, 0).cpu().detach().numpy() * 255).astype(np.uint8)
-            right_frame = (right.permute(1, 2, 0).cpu().detach().numpy() * 255).astype(np.uint8)
+FNAME = args.input
+BATCH_SIZE = int(args.batchsize)
+OUTFILE = args.output
 
-            # Combine left and right frames side by side
-            combined_frame = np.hstack((left_frame, right_frame))
-            
-            # Write the frame into the video
-            out.write(cv2.cvtColor(combined_frame, cv2.COLOR_RGB2BGR))  # OpenCV uses BGR, convert from RGB
+# Get user input for video clipping
+start_frame = int(input("Enter the starting frame number: "))
+total_frames = int(input("Enter the total number of frames for the clip: "))
 
-    out.release()
-    print(f"Video saved to {output_file}")
+# Calculate the number of batches to process
+batches_to_process = (total_frames + BATCH_SIZE - 1) // BATCH_SIZE  # Ceiling division
+frames_processed = 0
+left_outs = []
+right_outs = []
+total_time = 0
+save_per_x_batch = 1
+save_chunks_dir = os.path.join(os.getcwd(), ".chunks")
+os.makedirs(save_chunks_dir, exist_ok=True)
 
-FNAME = "video.mkv"
-BATCH_SIZE = 4
+def create_side_by_side_video(left_batch, right_batch, out):
+    for left, right in zip(left_batch, right_batch):
+        # Convert torch tensors to numpy arrays and then to uint8 for cv2
+        left_frame = (left.permute(1, 2, 0).cpu().detach().numpy() * 255).astype(np.uint8)
+        right_frame = (right.permute(1, 2, 0).cpu().detach().numpy() * 255).astype(np.uint8)
+
+        # Combine left and right frames side by side
+        combined_frame = np.hstack((left_frame, right_frame))
+        
+        # Write the frame into the video
+        out.write(cv2.cvtColor(combined_frame, cv2.COLOR_RGB2BGR))  # OpenCV uses BGR, convert from RGB
+
+
 
 def create_stereo_images(image, depth_map, divergence=2, convergence=0.5):
     """
@@ -97,6 +106,8 @@ def create_grid(shift, height, width, batch_size):
     grid = torch.stack([x + shift_normalized, y], dim=3)
     return grid
 
+mem_used_mb_pb = 0
+
 def process_batch(batch, model, device):
     """
     Process a single batch through the model and generate stereo images.
@@ -106,12 +117,21 @@ def process_batch(batch, model, device):
     :param device: The device to run computations on.
     :return: Tuple of left and right eye images.
     """
+    global mem_used_mb_pb
+    free, total = torch.cuda.mem_get_info(device)
+    mem_used_mb_pb = (total - free) / 1024 ** 2
+
     # Normalize input to [0, 1] range
     inp = (batch[0]).to(device) / 255.0
     
     try:
         # Model inference
+        free, total = torch.cuda.mem_get_info(device)
+        mem_used_mb = (total - free) / 1024 ** 2
         out = model.infer(inp)
+        free, total = torch.cuda.mem_get_info(device)
+        mem_used_mb_a = (total - free) / 1024 ** 2
+        if mem_used_mb_a > mem_used_mb: print("After Model Infer:", mem_used_mb, mem_used_mb_a)
         
         # Extract depth, considering only valid areas (mask > 0)
         valid_mask = out['mask'] > 0
@@ -122,10 +142,17 @@ def process_batch(batch, model, device):
         depth_max = valid_depth.amax()
         normalized_depth = torch.zeros_like(out['depth'])
         normalized_depth[valid_mask] = 1. - ((valid_depth - depth_min) / (depth_max - depth_min))
-        
+        # free, total = torch.cuda.mem_get_info(device)
+        # mem_used_mb = (total - free) / 1024 ** 2
+        # print("Process Batch Before Create Stereo:", mem_used_mb)
+
         # Create stereo images
         left_out, right_out = create_stereo_images(inp, normalized_depth)
         
+        # free, total = torch.cuda.mem_get_info(device)
+        # mem_used_mb = (total - free) / 1024 ** 2
+        # print("Process Batch After Create Sterio:", mem_used_mb)
+
         return left_out, right_out
     except Exception as e:
         print(f"An error occurred during processing: {e}")
@@ -138,20 +165,19 @@ model = MoGeModel.from_pretrained("Ruicheng/moge-vitl").to(device)
 stream = torchaudio.io.StreamReader(FNAME)
 stream.add_basic_video_stream(frames_per_chunk=BATCH_SIZE)
 
-# Get user input for video clipping
-start_frame = int(input("Enter the starting frame number: "))
-total_frames = int(input("Enter the total number of frames for the clip: "))
-
-# Calculate the number of batches to process
-batches_to_process = (total_frames + BATCH_SIZE - 1) // BATCH_SIZE  # Ceiling division
-frames_processed = 0
-
-left_outs = []
-right_outs = []
-total_time = 0
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for .mp4
+height, width = None, None
+out = None
+fps = 25
 
 # Process only the specified frames
 for i, batch in enumerate(stream.stream()):
+    
+    if i == 0:
+        height, width = batch[0].shape[2:4]
+        print(batch[0].shape)
+        out = cv2.VideoWriter(OUTFILE, fourcc, fps, (width*2, height))
+
     if frames_processed >= start_frame + total_frames:
         break  # Stop processing once we've processed the desired number of frames
 
@@ -160,15 +186,21 @@ for i, batch in enumerate(stream.stream()):
         
         left_out, right_out = process_batch(batch, model, device)
         
+        free, total = torch.cuda.mem_get_info(device)
+        mem_used_mb_pb_a = (total - free) / 1024 ** 2
+        if mem_used_mb_pb_a > mem_used_mb_pb: print("Process Batch End:", mem_used_mb_pb, mem_used_mb_pb_a)
+
         if left_out is not None and right_out is not None:
-            left_outs.append(left_out)
-            right_outs.append(right_out)
-            print(f"Left out shape: {left_out.shape}, Right out shape: {right_out.shape}")
-            batch_time = time() - start_time
-            total_time += batch_time
-            print(f"Batch {i} processed in {batch_time:.2f} seconds")
+            create_side_by_side_video(left_out, right_out, out)
+            # left_outs.append(left_out.to('cpu'))
+            # right_outs.append(right_out.to('cpu'))
+            # print(f"Left out shape: {left_out.shape}, Right out shape: {right_out.shape}")
         else:
             print(f"Batch {i} processing failed")
+
+        batch_time = time() - start_time
+        total_time += batch_time
+        print(f"Batch {i} Processed in {batch_time:.2f} seconds")
     
     frames_processed += BATCH_SIZE  # Increment by batch size
 
@@ -178,4 +210,4 @@ for i, batch in enumerate(stream.stream()):
 print(f"Total processing time: {total_time:.2f} seconds")
 
 # Create the side-by-side video with only the clipped frames
-create_side_by_side_video(left_outs, right_outs)
+out.release()
